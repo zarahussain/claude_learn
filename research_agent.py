@@ -32,7 +32,12 @@ report with:
 - A "Sources" section at the end listing every URL you relied on
 
 Prioritize accuracy and cite sources for factual claims. Note any notable \
-disagreement between sources rather than papering over it."""
+disagreement between sources rather than papering over it.
+
+Your final message must contain ONLY the markdown report itself: no preamble \
+like "Here is the report", no commentary about your search process, and \
+nothing after the Sources section. Start the final message directly with the \
+report's title heading."""
 
 
 def slugify(topic: str) -> str:
@@ -44,21 +49,21 @@ async def research(topic: str, max_turns: int) -> str:
     options = ClaudeAgentOptions(
         system_prompt=SYSTEM_PROMPT,
         allowed_tools=["WebSearch"],
-        permission_mode="bypassPermissions",
         max_turns=max_turns,
     )
 
-    report_parts: list[str] = []
+    last_text = ""
 
     async for message in query(
         prompt=f"Research this topic and write the markdown report: {topic}",
         options=options,
     ):
         if isinstance(message, AssistantMessage):
+            text_blocks = [b.text for b in message.content if isinstance(b, TextBlock)]
+            if text_blocks:
+                last_text = "\n".join(text_blocks)
             for block in message.content:
-                if isinstance(block, TextBlock):
-                    report_parts.append(block.text)
-                elif isinstance(block, ToolUseBlock) and block.name == "WebSearch":
+                if isinstance(block, ToolUseBlock) and block.name == "WebSearch":
                     query_str = block.input.get("query", "")
                     print(f"  searching: {query_str}", file=sys.stderr)
         elif isinstance(message, ResultMessage):
@@ -66,7 +71,13 @@ async def research(topic: str, max_turns: int) -> str:
             if cost is not None:
                 print(f"  done (cost: ${cost:.4f})", file=sys.stderr)
 
-    return "\n".join(report_parts).strip()
+    # Safety net: if the model still added preamble before the report despite
+    # instructions, drop everything before the first top-level heading.
+    match = re.search(r"^# .+", last_text, re.MULTILINE)
+    if match:
+        last_text = last_text[match.start():]
+
+    return last_text.strip()
 
 
 def main() -> None:
