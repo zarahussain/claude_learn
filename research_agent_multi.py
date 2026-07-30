@@ -72,8 +72,15 @@ async def run_agent(
     allowed_tools: list[str],
     max_turns: int,
     on_search=None,
+    label: str = "agent",
 ) -> tuple[str, float]:
-    """Run one Claude agent to completion and return (final_text, cost_usd)."""
+    """Run one Claude agent to completion and return (final_text, cost_usd).
+
+    Degrades gracefully: if the underlying CLI errors out (e.g. it hit
+    max_turns before finishing), this returns whatever text was produced in
+    earlier turns instead of raising, so one struggling agent in a fan-out
+    doesn't take the whole pipeline down.
+    """
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
         allowed_tools=allowed_tools,
@@ -83,17 +90,20 @@ async def run_agent(
     last_text = ""
     cost = 0.0
 
-    async for message in query(prompt=prompt, options=options):
-        if isinstance(message, AssistantMessage):
-            text_blocks = [b.text for b in message.content if isinstance(b, TextBlock)]
-            if text_blocks:
-                last_text = "\n".join(text_blocks)
-            if on_search:
-                for block in message.content:
-                    if isinstance(block, ToolUseBlock) and block.name == "WebSearch":
-                        on_search(block.input.get("query", ""))
-        elif isinstance(message, ResultMessage):
-            cost = getattr(message, "total_cost_usd", None) or 0.0
+    try:
+        async for message in query(prompt=prompt, options=options):
+            if isinstance(message, AssistantMessage):
+                text_blocks = [b.text for b in message.content if isinstance(b, TextBlock)]
+                if text_blocks:
+                    last_text = "\n".join(text_blocks)
+                if on_search:
+                    for block in message.content:
+                        if isinstance(block, ToolUseBlock) and block.name == "WebSearch":
+                            on_search(block.input.get("query", ""))
+            elif isinstance(message, ResultMessage):
+                cost = getattr(message, "total_cost_usd", None) or 0.0
+    except Exception as exc:
+        print(f"  [{label}] agent error, using partial output: {exc}", file=sys.stderr)
 
     # Safety net: drop anything before the first heading, in case the model
     # added preamble despite instructions.
@@ -122,7 +132,9 @@ def parse_subtopics(raw: str, fallback_topic: str, count: int) -> list[str]:
 
 async def plan(topic: str, subtopic_count: int) -> list[str]:
     prompt = f"Topic: {topic}\n\nSplit this into {subtopic_count} research angles."
-    raw, _ = await run_agent(prompt, PLANNER_SYSTEM_PROMPT, allowed_tools=[], max_turns=1)
+    raw, _ = await run_agent(
+        prompt, PLANNER_SYSTEM_PROMPT, allowed_tools=[], max_turns=2, label="planner"
+    )
     return parse_subtopics(raw, topic, subtopic_count)
 
 
@@ -142,6 +154,7 @@ async def research_subtopic(topic: str, subtopic: str, index: int, max_turns: in
         allowed_tools=["WebSearch"],
         max_turns=max_turns,
         on_search=on_search,
+        label=f"researcher {index}",
     )
     print(f"  [{index}] done", file=sys.stderr)
     return memo, cost
@@ -150,7 +163,9 @@ async def research_subtopic(topic: str, subtopic: str, index: int, max_turns: in
 async def synthesize(topic: str, memos: list[str], max_turns: int) -> tuple[str, float]:
     joined = "\n\n---\n\n".join(memos)
     prompt = f"Topic: {topic}\n\nResearch memos to synthesize:\n\n{joined}"
-    return await run_agent(prompt, SYNTHESIZER_SYSTEM_PROMPT, allowed_tools=[], max_turns=max_turns)
+    return await run_agent(
+        prompt, SYNTHESIZER_SYSTEM_PROMPT, allowed_tools=[], max_turns=max_turns, label="synthesizer"
+    )
 
 
 async def multi_agent_research(
@@ -200,14 +215,14 @@ def main() -> None:
     parser.add_argument(
         "--subagent-max-turns",
         type=int,
-        default=5,
-        help="Max agent turns per researcher subagent (default: 5)",
+        default=8,
+        help="Max agent turns per researcher subagent (default: 8)",
     )
     parser.add_argument(
         "--synth-max-turns",
         type=int,
-        default=4,
-        help="Max agent turns for the synthesizer agent (default: 4)",
+        default=6,
+        help="Max agent turns for the synthesizer agent (default: 6)",
     )
     args = parser.parse_args()
 
